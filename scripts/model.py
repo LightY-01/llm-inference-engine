@@ -4,11 +4,12 @@ from torchtyping import TensorType
 from typing import List, Optional, Tuple
 
 class KVCache:
-    def __init__(self, context_length: int): # Added context_length
+    def __init__(self, context_length: int):
         # (batch, num_kv_heads, seq_len, head_dim)
         self.cache_k: Optional[torch.Tensor] = None  
         self.cache_v: Optional[torch.Tensor] = None
         self.context_length = context_length 
+        self.disable_truncation = False
 
     def update(self, new_k: torch.Tensor, new_v: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.cache_k is None:
@@ -18,7 +19,7 @@ class KVCache:
             self.cache_k = torch.cat((self.cache_k, new_k), dim=2)
             self.cache_v = torch.cat((self.cache_v, new_v), dim=2)
 
-        if self.cache_k.shape[2] > self.context_length:
+        if not self.disable_truncation and self.cache_k.shape[2] > self.context_length:
             self.cache_k = self.cache_k[:, :, -self.context_length:, :]
             self.cache_v = self.cache_v[:, :, -self.context_length:, :]
 
@@ -33,29 +34,39 @@ class KVCache:
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, model_dim: int, num_heads: int, num_kv_heads: int, context_length: int, num_blocks: int = 4):
         super().__init__()
+        # Store context_length for positional embedding logic
         self.context_length = context_length 
+        # Word embeddings
         self.word_embeddings = nn.Embedding(vocab_size, model_dim)
+        # Positional embeddings
         self.pos_embeddings = nn.Embedding(context_length, model_dim)
+        # Transformer blocks with Grouped Query Attention and Vanilla Neural Network
         self.blocks = nn.ModuleList([self.TransformerBlock(model_dim, num_heads, num_kv_heads) for _ in range(num_blocks)])
+        # Layer normalization
         self.ln1 = nn.LayerNorm(model_dim)
+        # Projection to vocabulary size
         self.proj = nn.Linear(model_dim, vocab_size)
 
-    def forward(self, context: TensorType[int], kv_caches: Optional[List[KVCache]] = None) -> TensorType[float]:
+    def forward(self, context: TensorType[int], kv_caches: Optional[List[KVCache]] = None, attention_mask: Optional[torch.Tensor] = None, positions: Optional[torch.Tensor] = None) -> TensorType[float]:
         B, T = context.shape
         embeddings = self.word_embeddings(context)
         
-        prev_len = 0
-        if kv_caches is not None and len(kv_caches) > 0 and kv_caches[0].cache_k is not None:
-            prev_len = kv_caches[0].cache_k.shape[2]
-            
-        start_pos = min(prev_len, self.context_length - T)
-        positions = torch.arange(start_pos, start_pos + T, device=context.device)
+        if positions is None:
+            prev_len = 0
+            if kv_caches is not None and len(kv_caches) > 0 and kv_caches[0].cache_k is not None:
+                prev_len = kv_caches[0].cache_k.shape[2]
+                
+            # Use a sliding window for positions to stay within [0, context_length - 1]
+            # During generation, we align the sequence to the end of the context window
+            start_pos = min(prev_len, self.context_length - T)
+            positions = torch.arange(start_pos, start_pos + T, device=context.device)
+        
         embeddings = embeddings + self.pos_embeddings(positions)
         
         x = embeddings
         for i, block in enumerate(self.blocks):
             kv_cache = kv_caches[i] if kv_caches is not None else None
-            x = block(x, kv_cache)
+            x = block(x, kv_cache, attention_mask)
             
         result = self.ln1(x)
         logits = self.proj(result)
@@ -79,7 +90,7 @@ class GPT(nn.Module):
                 # Output projection
                 self.output_proj = nn.Linear(num_heads * self.head_dim, model_dim, bias=False)
 
-            def forward(self, x: TensorType[float], kv_cache: Optional[KVCache] = None) -> TensorType[float]:
+            def forward(self, x: TensorType[float], kv_cache: Optional[KVCache] = None, attention_mask: Optional[torch.Tensor] = None) -> TensorType[float]:
                 B, T, D = x.shape
                 q = self.q_proj(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
                 k = self.k_proj(x).view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
@@ -96,10 +107,21 @@ class GPT(nn.Module):
                 # Scaled dot-product attention
                 scores = (q @ k.transpose(-2, -1)) * (self.head_dim ** -0.5)
                 T_total = k.shape[2]
-                mask = torch.tril(torch.ones(T, T, device=x.device))
+                causal_mask = torch.tril(torch.ones(T, T, device=x.device))
                 if T_total > T:
                     padding = torch.ones(T, T_total - T, device=x.device)
-                    mask = torch.cat([padding, mask], dim=-1)
+                    causal_mask = torch.cat([padding, causal_mask], dim=-1)
+                
+                mask = causal_mask.unsqueeze(0).unsqueeze(1) # shape: (1, 1, T, T_total)
+                if attention_mask is not None:
+                    if attention_mask.dim() == 2:
+                        attn_mask = attention_mask.unsqueeze(1).unsqueeze(2) # shape: (B, 1, 1, T_total)
+                    elif attention_mask.dim() == 3:
+                        attn_mask = attention_mask.unsqueeze(1) # shape: (B, 1, T, T_total)
+                    else:
+                        attn_mask = attention_mask
+                    mask = mask * attn_mask
+                
                 scores = scores.masked_fill(mask == 0, float('-inf'))
                 weights = torch.softmax(scores, dim=-1)
 
@@ -126,7 +148,7 @@ class GPT(nn.Module):
             self.first_norm = nn.LayerNorm(model_dim)
             self.second_norm = nn.LayerNorm(model_dim)
 
-        def forward(self, embedded: TensorType[float], kv_cache: Optional[KVCache] = None) -> TensorType[float]:
-            embedded = embedded + self.attention(self.first_norm(embedded), kv_cache)
+        def forward(self, embedded: TensorType[float], kv_cache: Optional[KVCache] = None, attention_mask: Optional[torch.Tensor] = None) -> TensorType[float]:
+            embedded = embedded + self.attention(self.first_norm(embedded), kv_cache, attention_mask)
             embedded = embedded + self.linear_network(self.second_norm(embedded))
             return embedded
